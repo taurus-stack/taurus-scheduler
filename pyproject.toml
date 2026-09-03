@@ -1,0 +1,37 @@
+[tool.poetry]
+name = "taurus-scheduler"
+version = "1.0.0"
+description = "Taurus Standalone Scheduler Service - Decoupled from main application, handles scheduled task triggering"
+authors = ["Taurus Team"]
+license = "AGPL-3.0-or-later"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = ">=3.12.11,<3.13"
+apscheduler = "3.10.4"
+PyMySQL = "1.1.1"
+cryptography = "43.0.3"
+SQLAlchemy = "2.0.36"
+redis = "5.2.1"
+croniter = "3.0.3"
+pydantic = "2.10.3"
+pydantic-settings = "2.6.1"
+httpx = "0.28.1"
+uvicorn = "0.32.1"
+fastapi = "0.115.4"
+prometheus-client = "0.21.0"
+structlog = "24.4.0"
+python-dotenv = "1.0.1"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "8.4.2"
+pytest-asyncio = "0.25.0"
+
+[[tool.poetry.source]]
+name = "tsinghua"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple/"
+priority = "primary"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
