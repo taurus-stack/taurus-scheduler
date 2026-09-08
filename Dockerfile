@@ -3,9 +3,12 @@ FROM python:3.12-slim AS base
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     POETRY_VERSION=2.0.1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
+    PIP_TRUSTED_HOST=mirrors.aliyun.com
 
-RUN apt-get update \
+RUN sed -i 's|http://deb.debian.org/debian|https://mirrors.aliyun.com/debian|g' /etc/apt/sources.list.d/debian.sources \
+ && apt-get update \
  && apt-get install -y --no-install-recommends curl build-essential default-libmysqlclient-dev pkg-config \
  && pip install --upgrade pip "poetry==$POETRY_VERSION" \
  && poetry config virtualenvs.create false \
@@ -16,7 +19,7 @@ WORKDIR /app
 COPY pyproject.toml poetry.lock* ./
 
 RUN if [ -f poetry.lock ]; then \
-      poetry install --no-interaction --no-ansi --only main; \
+      poetry install --no-interaction --no-ansi --only main --no-root; \
     else \
       poetry install --no-interaction --no-ansi --only main --no-root; \
     fi
