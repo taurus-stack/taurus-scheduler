@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     REDIS_LOCK_PREFIX: str = "taurus:scheduler:lock:"
     REDIS_QUEUE_KEY: str = "taurus:scheduler:queue:script_task"
     REDIS_WORKFLOW_QUEUE_KEY: str = "taurus:scheduler:queue:workflow"
+    REDIS_MAINTENANCE_QUEUE_KEY: str = "taurus:scheduler:queue:maintenance"
     REDIS_DEDUP_PREFIX: str = "taurus:scheduler:dedup:"
 
     # Scheduler configuration

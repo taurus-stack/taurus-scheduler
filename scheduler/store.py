@@ -90,6 +90,39 @@ class WorkflowRow:
         return f"workflow:{self.id}"
 
 
+@dataclass
+class ScheduleRow:
+    """Legacy Schedule model (single script / workflow scheduling via Celery Beat).
+    Now picked up by taurus-scheduler directly."""
+    id: int
+    name: str
+    description: Optional[str]
+    schedule_type: ScheduleType
+    cron_expression: Optional[str]
+    interval_seconds: Optional[int]
+    run_once_at: Optional[datetime]
+    target_type: str = "script"
+    template_id: Optional[int] = None
+    workflow_id: Optional[int] = None
+    dag_version_id: Optional[int] = None
+    status: int = 1
+    envs: dict[str, Any] = field(default_factory=dict)
+    args: list[Any] = field(default_factory=list)
+    last_run_time: Optional[datetime] = None
+    next_run_time: Optional[datetime] = None
+    creator_id: Optional[int] = None
+    create_datetime: Optional[datetime] = None
+    update_datetime: Optional[datetime] = None
+
+    @property
+    def job_id(self) -> str:
+        return f"schedule:{self.id}"
+
+    @property
+    def enabled(self) -> bool:
+        return self.status == 1
+
+
 class TaskStore:
     """Task data access layer: direct access to shared database"""
 
@@ -592,6 +625,114 @@ class TaskStore:
             workflow_mode=str(r.get("workflow_mode") or "dag"),
             dag_published_version_id=int(r["dag_published_version_id"]) if r.get("dag_published_version_id") is not None else None,
             global_timeout_sec=int(r.get("global_timeout_sec") or 0),
+            creator_id=int(r["creator_id"]) if r.get("creator_id") else None,
+            create_datetime=r.get("create_datetime"),
+            update_datetime=r.get("update_datetime"),
+        )
+
+    # ---------------- Legacy Schedule table ----------------
+    def list_enabled_schedules(self) -> list[ScheduleRow]:
+        tbl = self.settings.schedule_table
+        sql = text(f"""
+            SELECT id, name, description, schedule_type,
+                   cron_expression, interval_seconds, run_once_at,
+                   target_type, template_id, workflow_id, dag_version_id,
+                   status, envs, args,
+                   last_run_time, next_run_time,
+                   creator_id, create_datetime, update_datetime
+            FROM `{tbl}`
+            WHERE status = 1
+        """)
+        rows = []
+        with self.Session() as session:
+            for r in session.execute(sql).mappings().all():
+                rows.append(self._row_to_schedule(dict(r)))
+        return rows
+
+    def get_schedule(self, schedule_id: int) -> Optional[ScheduleRow]:
+        tbl = self.settings.schedule_table
+        sql = text(f"""
+            SELECT id, name, description, schedule_type,
+                   cron_expression, interval_seconds, run_once_at,
+                   target_type, template_id, workflow_id, dag_version_id,
+                   status, envs, args,
+                   last_run_time, next_run_time,
+                   creator_id, create_datetime, update_datetime
+            FROM `{tbl}`
+            WHERE id = :id
+        """)
+        with self.Session() as session:
+            r = session.execute(sql, {"id": schedule_id}).mappings().first()
+            return self._row_to_schedule(dict(r)) if r else None
+
+    def list_missed_schedules(self, grace_seconds: int) -> list[ScheduleRow]:
+        from datetime import timedelta
+        now = datetime.now()
+        cutoff = now - timedelta(seconds=grace_seconds)
+        tbl = self.settings.schedule_table
+        sql = text(f"""
+            SELECT id, name, description, schedule_type,
+                   cron_expression, interval_seconds, run_once_at,
+                   target_type, template_id, workflow_id, dag_version_id,
+                   status, envs, args,
+                   last_run_time, next_run_time,
+                   creator_id, create_datetime, update_datetime
+            FROM `{tbl}`
+            WHERE status = 1
+              AND next_run_time IS NOT NULL
+              AND next_run_time >= :cutoff
+              AND next_run_time <= :now
+              AND (last_run_time IS NULL OR last_run_time < next_run_time)
+        """)
+        rows = []
+        with self.Session() as session:
+            for r in session.execute(sql, {"cutoff": cutoff, "now": now}).mappings().all():
+                rows.append(self._row_to_schedule(dict(r)))
+        return rows
+
+    def update_schedule_after_execution(
+        self,
+        schedule_id: int,
+        next_run_time: Optional[datetime] = None,
+    ) -> None:
+        tbl = self.settings.schedule_table
+        now = datetime.now()
+        fields = ["last_run_time = :now"]
+        params: dict[str, Any] = {"id": schedule_id, "now": now}
+        if next_run_time is not None:
+            fields.append("next_run_time = :next")
+            params["next"] = next_run_time
+        sql = text(f"UPDATE `{tbl}` SET {', '.join(fields)} WHERE id = :id")
+        with self.Session() as session:
+            session.execute(sql, params)
+            session.commit()
+
+    def disable_schedule_once(self, schedule_id: int) -> None:
+        tbl = self.settings.schedule_table
+        sql = text(f"UPDATE `{tbl}` SET status = 0 WHERE id = :id AND schedule_type = 'once'")
+        with self.Session() as session:
+            session.execute(sql, {"id": schedule_id})
+            session.commit()
+
+    @staticmethod
+    def _row_to_schedule(r: dict) -> ScheduleRow:
+        return ScheduleRow(
+            id=int(r["id"]),
+            name=str(r["name"]),
+            description=r.get("description"),
+            schedule_type=ScheduleType(r.get("schedule_type") or "once"),
+            cron_expression=r.get("cron_expression"),
+            interval_seconds=int(r["interval_seconds"]) if r.get("interval_seconds") is not None else None,
+            run_once_at=r.get("run_once_at"),
+            target_type=str(r.get("target_type") or "script"),
+            template_id=int(r["template_id"]) if r.get("template_id") else None,
+            workflow_id=int(r["workflow_id"]) if r.get("workflow_id") else None,
+            dag_version_id=int(r["dag_version_id"]) if r.get("dag_version_id") else None,
+            status=int(r.get("status") or 0),
+            envs=r.get("envs") or {},
+            args=r.get("args") or [],
+            last_run_time=r.get("last_run_time"),
+            next_run_time=r.get("next_run_time"),
             creator_id=int(r["creator_id"]) if r.get("creator_id") else None,
             create_datetime=r.get("create_datetime"),
             update_datetime=r.get("update_datetime"),

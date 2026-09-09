@@ -274,6 +274,96 @@ class TaskDispatcher:
             logger.exception("dispatcher.workflow_unexpected_error", workflow_id=wf.id, error=str(e))
             return False
 
+    # ---------- Legacy Schedule Dispatch ----------
+    async def dispatch_schedule(
+        self,
+        sch,
+        scheduled_fire_time: Optional[datetime] = None,
+        trigger_type: str = "schedule",
+        force: bool = False,
+    ) -> bool:
+        """
+        Dispatch a legacy Schedule (single script or workflow) job.
+        Pushes a payload to the script_task queue; the worker calls
+        taurus.tasks.execute_schedule_task(schedule_id) which handles the
+        actual execution based on sch.target_type.
+        """
+        dedup_key = self._schedule_dedup_key(sch, scheduled_fire_time)
+        if not force:
+            if self.redis.set(dedup_key, "1", nx=True, ex=self.settings.SCHEDULER_DEDUP_TTL):
+                logger.debug("sch_dedup.pass", schedule_id=sch.id, key=dedup_key)
+            else:
+                logger.info("sch_dedup.skipped", schedule_id=sch.id, key=dedup_key)
+                return False
+
+        try:
+            from .store import ScheduleRow
+            payload = {
+                "source": "taurus-scheduler",
+                "v": 1,
+                "target_type": "schedule",
+                "dispatched_at": datetime.now().isoformat(),
+                "schedule_id": sch.id,
+                "schedule_type": sch.schedule_type.value,
+                "name": sch.name,
+                "scheduled_fire_time": scheduled_fire_time.isoformat() if scheduled_fire_time else None,
+            }
+
+            dispatched_ok = await self._push_to_queue(payload)
+            if not dispatched_ok:
+                logger.error("dispatcher.schedule_queue_push_failed", schedule_id=sch.id)
+                return False
+
+            logger.info("dispatcher.schedule_dispatched",
+                        schedule_id=sch.id,
+                        name=sch.name,
+                        target_type=sch.target_type)
+            return True
+
+        except Exception as e:
+            logger.exception("dispatcher.schedule_unexpected_error", schedule_id=sch.id, error=str(e))
+            return False
+
+    def _schedule_dedup_key(self, sch, scheduled_fire_time: Optional[datetime]) -> str:
+        ft = scheduled_fire_time or datetime.now()
+        minute_str = ft.strftime("%Y%m%d%H%M")
+        raw = f"sch:{sch.id}:{minute_str}"
+        return f"{self.settings.REDIS_DEDUP_PREFIX}{hashlib.md5(raw.encode()).hexdigest()}"
+
+    # ---------- Maintenance Dispatch ----------
+    async def dispatch_maintenance(
+        self,
+        task_name: str,
+        params: dict[str, Any] | None = None,
+        force: bool = False,
+    ) -> bool:
+        """
+        Dispatch a maintenance job (e.g. check_host_heartbeat_timeout,
+        cleanup_old_heartbeat_records) to the Redis maintenance queue.
+        """
+        payload = {
+            "source": "taurus-scheduler",
+            "v": 1,
+            "target_type": "maintenance",
+            "task_name": task_name,
+            "params": params or {},
+            "dispatched_at": datetime.now().isoformat(),
+        }
+        try:
+            key = self.settings.REDIS_MAINTENANCE_QUEUE_KEY
+            msg = json.dumps(payload, ensure_ascii=False)
+            self.redis.ltrim(key, 0, 9999)
+            pushed = self.redis.lpush(key, msg)
+            ok = pushed > 0
+            if ok:
+                logger.info("dispatcher.maintenance_dispatched", task_name=task_name)
+            else:
+                logger.error("dispatcher.maintenance_push_failed", task_name=task_name)
+            return ok
+        except Exception as e:
+            logger.exception("dispatcher.maintenance_error", task_name=task_name, error=str(e))
+            return False
+
     def _workflow_dedup_key(self, wf: WorkflowRow, scheduled_fire_time: Optional[datetime]) -> str:
         ft = scheduled_fire_time or datetime.now()
         minute_str = ft.strftime("%Y%m%d%H%M")
