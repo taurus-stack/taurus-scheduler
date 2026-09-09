@@ -29,7 +29,7 @@ from .config import get_settings
 from .dispatcher import TaskDispatcher
 from .lock import LeaderElector
 from .logging_config import setup_logging
-from .store import ScriptTaskRow, WorkflowRow, ScheduleType, TaskStore, TaskStatus
+from .store import ScriptTaskRow, WorkflowRow, ScheduleRow, ScheduleType, TaskStore, TaskStatus
 
 import structlog
 
@@ -190,6 +190,7 @@ class ScriptTaskScheduler:
         try:
             self._sync_jobs_from_db(force=True)
             self._compensate_missed_jobs()
+            self._register_maintenance_jobs()
             # Resume scheduling
             self.scheduler.resume()
             logger.info("apscheduler.resumed")
@@ -239,6 +240,12 @@ class ScriptTaskScheduler:
         except Exception as e:
             logger.error("sync.load_workflows_failed", error=str(e))
             workflows = []
+
+        try:
+            schedules = self.store.list_enabled_schedules()
+        except Exception as e:
+            logger.error("sync.load_schedules_failed", error=str(e))
+            schedules = []
 
         # ScriptTask jobs
         db_task_ids = {t.id for t in tasks}
@@ -290,6 +297,31 @@ class ScriptTaskScheduler:
                              added=wf.id not in current_wf_job_ids,
                              schedule_type=wf.schedule_type.value)
 
+        # Legacy Schedule jobs
+        db_sch_ids = {s.id for s in schedules}
+        current_sch_job_ids = {j.id.split(":", 1)[1] for j in self.scheduler.get_jobs()
+                               if j.id.startswith("schedule:")}
+        current_sch_job_ids = {int(x) for x in current_sch_job_ids if x.isdigit()}
+
+        for missing in current_sch_job_ids - db_sch_ids:
+            job_id = f"schedule:{missing}"
+            try:
+                self.scheduler.remove_job(job_id)
+                logger.info("sync.schedule_job_removed", job_id=job_id)
+            except JobLookupError:
+                pass
+            self._last_sync_version.pop(("schedule", missing), None)
+
+        for sch in schedules:
+            version = self._job_version(sch)
+            key = ("schedule", sch.id)
+            if force or self._last_sync_version.get(key) != version:
+                self._upsert_job(sch)
+                self._last_sync_version[key] = version
+                logger.debug("sync.schedule_upserted", schedule_id=sch.id,
+                             added=sch.id not in current_sch_job_ids,
+                             schedule_type=sch.schedule_type.value)
+
     @staticmethod
     def _job_version(t) -> str:
         """Used to determine if task schedule config has changed; if changed, Trigger must be rebuilt"""
@@ -300,6 +332,15 @@ class ScriptTaskScheduler:
                 str(t.interval_seconds or ""),
                 t.run_once_at.isoformat() if isinstance(t.run_once_at, datetime) else "",
                 str(t.schedule_enabled),
+                t.update_datetime.isoformat() if isinstance(t.update_datetime, datetime) else "",
+            ]
+        elif isinstance(t, ScheduleRow):
+            parts = [
+                str(t.schedule_type.value),
+                str(t.cron_expression or ""),
+                str(t.interval_seconds or ""),
+                t.run_once_at.isoformat() if isinstance(t.run_once_at, datetime) else "",
+                str(t.status),
                 t.update_datetime.isoformat() if isinstance(t.update_datetime, datetime) else "",
             ]
         else:
@@ -314,9 +355,10 @@ class ScriptTaskScheduler:
         return "|".join(parts)
 
     def _upsert_job(self, task) -> None:
-        """Create APScheduler Trigger based on ScriptTask / Workflow configuration"""
+        """Create APScheduler Trigger based on ScriptTask / Workflow / Schedule configuration"""
         is_workflow = isinstance(task, WorkflowRow)
-        prefix = "workflow" if is_workflow else "script_task"
+        is_schedule = isinstance(task, ScheduleRow)
+        prefix = "workflow" if is_workflow else ("schedule" if is_schedule else "script_task")
         job_id = f"{prefix}:{task.id}"
         trigger = self._make_trigger(task)
         if trigger is None:
@@ -329,7 +371,7 @@ class ScriptTaskScheduler:
             trigger=trigger,
             id=job_id,
             name=task.name,
-            args=[task.id, is_workflow],
+            args=[task.id, is_workflow, is_schedule],
             replace_existing=True,
         )
 
@@ -345,6 +387,9 @@ class ScriptTaskScheduler:
                 if is_workflow:
                     self.store.update_workflow_next_exec_time(task.id, None)
                     self.store.disable_workflow_schedule(task.id)
+                elif is_schedule:
+                    self.store.update_schedule_after_execution(task.id, None)
+                    self.store.disable_schedule_once(task.id)
                 else:
                     self.store.update_task_next_exec_time(task.id, None)
                     self.store.disable_task(task.id)
@@ -365,6 +410,8 @@ class ScriptTaskScheduler:
                     nxt = nxt.astimezone(self.tz).replace(tzinfo=None)
                 if is_workflow:
                     self.store.update_workflow_next_exec_time(task.id, nxt)
+                elif is_schedule:
+                    self.store.update_schedule_after_execution(task.id, nxt)
                 else:
                     self.store.update_task_next_exec_time(task.id, nxt)
         except Exception as e:
@@ -466,15 +513,17 @@ class ScriptTaskScheduler:
         return None
 
     # ===================== Job Execution Entry (APScheduler callback) =====================
-    def _job_runner(self, task_id: int, is_workflow: bool = False) -> None:
+    def _job_runner(self, task_id: int, is_workflow: bool = False, is_schedule: bool = False) -> None:
         """Called by APScheduler in worker thread when job is due"""
         if not self.leader.is_leader:
-            logger.info("runner.skip_not_leader", task_id=task_id, is_workflow=is_workflow)
+            logger.info("runner.skip_not_leader", task_id=task_id, is_workflow=is_workflow, is_schedule=is_schedule)
             self._say(f"⏰  task_id={task_id} triggered on schedule, but not Leader, skipping")
             return
 
         if is_workflow:
             return self._run_workflow_job(task_id)
+        elif is_schedule:
+            return self._run_schedule_job(task_id)
         else:
             return self._run_script_task_job(task_id)
 
@@ -620,6 +669,107 @@ class ScriptTaskScheduler:
             except Exception as e:
                 logger.exception("runner.disable_once_task_failed", task_id=task.id, error=str(e))
 
+    def _run_schedule_job(self, schedule_id: int) -> None:
+        sch = self.store.get_schedule(schedule_id)
+        if sch is None:
+            logger.warning("runner.schedule_not_found", schedule_id=schedule_id)
+            self._say(f"⚠  schedule_id={schedule_id} is due, but does not exist in DB, removing APScheduler Job")
+            try:
+                self.scheduler.remove_job(f"schedule:{schedule_id}")
+            except JobLookupError:
+                pass
+            return
+        if not sch.enabled:
+            logger.info("runner.schedule_disabled", schedule_id=schedule_id)
+            self._say(f"⏹  schedule_id={schedule_id} ({sch.name[:40]}) is disabled, skipping")
+            return
+
+        self._say(f"⏰ Triggering Schedule id={schedule_id} name={sch.name[:40]} target={sch.target_type}")
+        scheduled_fire_time = datetime.now()
+
+        dispatched = False
+        try:
+            loop = asyncio.new_event_loop()
+            dispatched = loop.run_until_complete(
+                self.dispatcher.dispatch_schedule(sch, scheduled_fire_time=scheduled_fire_time)
+            )
+            loop.close()
+        except Exception as e:
+            logger.exception("runner.schedule_execute_error", schedule_id=schedule_id, error=str(e))
+            self._say(f"✗  schedule_id={schedule_id} dispatch exception: {type(e).__name__}: {str(e)[:120]}")
+            return
+
+        next_hint = ""
+        try:
+            job = self.scheduler.get_job(f"schedule:{schedule_id}")
+            if job and job.next_run_time:
+                nxt = job.next_run_time
+                try:
+                    aware = nxt
+                    if not hasattr(aware, "tzinfo") or aware.tzinfo is None:
+                        aware = self.tz.localize(aware)
+                    delta_sec = int((aware - datetime.now(self.tz)).total_seconds())
+                    next_hint = f"  next: {aware.strftime('%m-%d %H:%M:%S')} (in {self._fmt_delta(delta_sec)})"
+                except Exception:
+                    pass
+                if hasattr(nxt, "astimezone"):
+                    nxt = nxt.astimezone(self.tz).replace(tzinfo=None)
+                self.store.update_schedule_after_execution(schedule_id, nxt)
+        except Exception:
+            pass
+
+        if dispatched:
+            self._say(f"✅ Schedule dispatched id={schedule_id} →Redis queue{next_hint}")
+        else:
+            self._say(f"⚠  schedule_id={schedule_id} dispatcher returned False")
+
+        if sch.schedule_type == ScheduleType.ONCE and dispatched:
+            try:
+                self.store.disable_schedule_once(schedule_id)
+                self._say(f"⏹  schedule_id={schedule_id} is a one-time task, automatically disabled after dispatch")
+            except Exception as e:
+                logger.exception("runner.schedule_disable_once_failed", schedule_id=schedule_id, error=str(e))
+
+    # ===================== Maintenance Jobs =====================
+    def _run_maintenance_job(self, task_name: str, params: dict | None = None) -> None:
+        """Called by APScheduler for internal maintenance jobs (heartbeat check, record cleanup)."""
+        if not self.leader.is_leader:
+            return
+        try:
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(
+                self.dispatcher.dispatch_maintenance(task_name, params=params or {})
+            )
+            loop.close()
+        except Exception as e:
+            logger.exception("runner.maintenance_error", task_name=task_name, error=str(e))
+
+    def _register_maintenance_jobs(self) -> None:
+        """Register internal maintenance jobs when this instance becomes leader.
+        - check_host_heartbeat_timeout: every 60 seconds
+        - cleanup_old_heartbeat_records: daily at 02:30
+        """
+        try:
+            self.scheduler.add_job(
+                func=self._run_maintenance_job,
+                trigger=IntervalTrigger(seconds=60, timezone=self.tz),
+                id="maintenance:check_host_heartbeat_timeout",
+                name="check_host_heartbeat_timeout",
+                args=["check_host_heartbeat_timeout"],
+                replace_existing=True,
+            )
+            self.scheduler.add_job(
+                func=self._run_maintenance_job,
+                trigger=CronTrigger(hour=2, minute=30, timezone=self.tz),
+                id="maintenance:cleanup_old_heartbeat_records",
+                name="cleanup_old_heartbeat_records",
+                args=["cleanup_old_heartbeat_records", {"days": 30}],
+                replace_existing=True,
+            )
+            self._say("🛠  Registered maintenance jobs: heartbeat check (60s), heartbeat cleanup (daily 02:30)")
+        except Exception as e:
+            logger.exception("maintenance.register_failed", error=str(e))
+
     # ===================== Startup Compensation =====================
     def _compensate_missed_jobs(self) -> None:
         """Compensate missed tasks when becoming Leader:
@@ -638,13 +788,21 @@ class ScriptTaskScheduler:
             logger.error("compensate.wf_load_failed", error=str(e))
             missed_wf = []
 
-        if not missed and not missed_wf:
+        try:
+            missed_sch = self.store.list_missed_schedules(grace_seconds=grace)
+        except Exception as e:
+            logger.error("compensate.sch_load_failed", error=str(e))
+            missed_sch = []
+
+        if not missed and not missed_wf and not missed_sch:
             logger.info("compensate.no_missed")
             return
 
         logger.warning("compensate.found_missed",
-                       script_task_count=len(missed), workflow_count=len(missed_wf))
-        self._say(f"🔁 Startup compensation: found {len(missed)} missed ScriptTask + {len(missed_wf)} missed Workflow (grace={grace}s)")
+                       script_task_count=len(missed), workflow_count=len(missed_wf),
+                       schedule_count=len(missed_sch))
+        self._say(f"🔁 Startup compensation: found {len(missed)} missed ScriptTask + "
+                  f"{len(missed_wf)} missed Workflow + {len(missed_sch)} missed Schedule (grace={grace}s)")
 
         loop = asyncio.new_event_loop()
         success_n = 0
@@ -687,6 +845,25 @@ class ScriptTaskScheduler:
                     fail_n += 1
                     logger.exception("compensate.wf_failed", workflow_id=wf.id, error=str(e))
                     self._say(f"  ✗ Compensation exception workflow_id={wf.id}: {type(e).__name__}: {str(e)[:80]}")
+
+            for sch in missed_sch:
+                try:
+                    ok = loop.run_until_complete(
+                        self.dispatcher.dispatch_schedule(
+                            sch,
+                            scheduled_fire_time=sch.next_run_time,
+                            trigger_type="compensate",
+                        )
+                    )
+                    if ok:
+                        success_n += 1
+                    else:
+                        fail_n += 1
+                        self._say(f"  ✗ Compensation failed schedule_id={sch.id} dispatcher returned False")
+                except Exception as e:
+                    fail_n += 1
+                    logger.exception("compensate.sch_failed", schedule_id=sch.id, error=str(e))
+                    self._say(f"  ✗ Compensation exception schedule_id={sch.id}: {type(e).__name__}: {str(e)[:80]}")
         finally:
             loop.close()
         self._say(f"  ✅ Compensation complete: {success_n} succeeded {fail_n} failed")
