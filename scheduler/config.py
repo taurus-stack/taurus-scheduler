@@ -7,18 +7,18 @@ from functools import lru_cache
 from typing import Literal, Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# M1.9 —— 调度服务部署模式
-#   · ha_cluster  (企业版 EE)：Redis 主备选举 + 队列 + idempotent dedup + HTTP 兜底回调
-#   · standalone   (社区版 CE 单实例非 HA 降级)：无分布式锁、无队列、始终认为自己是 Leader，
-#                       直接 DB 轮询 + BACKEND_API 触发执行。若单机故障则停机直到恢复（不 HA）。
+# 调度服务部署模式（全功能版本不再按 edition 区分，由部署方自行选择）
+#   · standalone  ：单实例模式（默认，零配置）——无分布式锁、无队列、始终认为自己是
+#                    Leader，直接 DB 轮询 + BACKEND_API 触发执行；单机故障则停机直到恢复。
+#   · ha_cluster  ：Redis 主备选举 + 队列 + 幂等去重 + HTTP 兜底回调（多副本高可用）。
 DeploymentMode = Literal["standalone", "ha_cluster"]
 
 
-def _auto_resolve_mode(user_value: Optional[str], edition: str) -> DeploymentMode:
+def _resolve_deployment_mode(user_value: Optional[str]) -> DeploymentMode:
     if user_value and user_value.lower() in ("standalone", "ha_cluster"):
         return user_value.lower()  # type: ignore[return-value]
-    # 没显式配置时：跟随 TAURUS_EDITION
-    return "standalone" if edition.lower() == "community" else "ha_cluster"
+    # 默认单实例；需要 HA 时显式设置 SCHEDULER_DEPLOYMENT_MODE=ha_cluster
+    return "standalone"
 
 
 class Settings(BaseSettings):
@@ -57,15 +57,13 @@ class Settings(BaseSettings):
     SCHEDULER_MISFIRE_GRACE_SECONDS: int = 3600  # Re-run tasks missed within 1 hour
     SCHEDULER_DEDUP_TTL: int = 600  # Deduplication window: same task same minute only triggers once within 10 minutes
 
-    # M1.9 — Edition 与部署模式（跟随 TAURUS_EDITION 环境变量自动默认）
-    #  取值：standalone (CE, 单实例非 HA) / ha_cluster (EE, 完整 HA 主备 + 队列)
-    TAURUS_EDITION: str = "community"  # 对应后端同名 env；未设置则 fallback community
+    # 部署模式：standalone（默认，单实例）/ ha_cluster（Redis 选举 + 队列高可用）
     SCHEDULER_DEPLOYMENT_MODE: Optional[str] = None  # 手动覆盖，可强制切换
 
     @property
     def deployment_mode(self) -> DeploymentMode:
-        """解析最终部署模式（自动跟随 Edition）。"""
-        return _auto_resolve_mode(self.SCHEDULER_DEPLOYMENT_MODE, self.TAURUS_EDITION)
+        """解析最终部署模式。"""
+        return _resolve_deployment_mode(self.SCHEDULER_DEPLOYMENT_MODE)
 
     @property
     def is_standalone(self) -> bool:
